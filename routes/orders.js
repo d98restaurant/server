@@ -209,7 +209,8 @@ router.get('/credit-ledger/:customerId', authenticate, async (req, res) => {
       'payment.status': 'credit_due',
       $or: [
         { 'payment.customerId': customerId },
-        { 'payment.customerName': { $regex: customerId, $options: 'i' } }
+        { 'payment.customerName': { $regex: customerId, $options: 'i' } },
+        { 'customer.name': { $regex: customerId, $options: 'i' } }
       ],
       status: { $ne: 'cancelled' }
     }).sort({ createdAt: -1 });
@@ -217,6 +218,174 @@ router.get('/credit-ledger/:customerId', authenticate, async (req, res) => {
     res.json(orders);
   } catch (error) {
     console.error('Error fetching credit ledger:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET ALL CREDIT CUSTOMERS WITH TOTAL DUE - For Credit Ledger Modal
+router.get('/credit-customers', authenticate, async (req, res) => {
+  try {
+    const creditOrders = await Order.find({
+      'payment.method': 'credit',
+      'payment.status': 'credit_due',
+      status: { $ne: 'cancelled' }
+    }).sort({ createdAt: -1 });
+    
+    const customersMap = new Map();
+    
+    creditOrders.forEach(order => {
+      // Get customer name from various sources
+      let customerName = null;
+      let customerPhone = null;
+      let customerId = null;
+      
+      if (order.customer && order.customer.name) {
+        customerName = order.customer.name;
+        customerPhone = order.customer.phone || '';
+        customerId = order.customer._id || order.customer.name;
+      } else if (order.payment && order.payment.customerName) {
+        customerName = order.payment.customerName;
+        customerPhone = order.payment.customerPhone || '';
+        customerId = order.payment.customerId || customerName;
+      }
+      
+      // Skip if no customer name or it's a generic name
+      if (!customerName || customerName === 'Walk-In' || customerName === 'Unknown Customer') {
+        return;
+      }
+      
+      const key = customerId || customerName;
+      
+      if (!customersMap.has(key)) {
+        customersMap.set(key, {
+          customerId: key,
+          customerName: customerName,
+          customerPhone: customerPhone,
+          totalDue: 0,
+          orders: []
+        });
+      }
+      
+      const customer = customersMap.get(key);
+      customer.totalDue += order.total || 0;
+      customer.orders.push({
+        _id: order._id,
+        orderNumber: order.orderNumber,
+        displayOrderNumber: order.displayOrderNumber,
+        total: order.total,
+        createdAt: order.createdAt,
+        dueDate: order.payment?.dueDate,
+        items: order.items,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        serviceCharge: order.serviceCharge,
+        customerName: customerName,
+        customerPhone: customerPhone,
+        orderType: order.orderType,
+        tableNumber: order.tableNumber
+      });
+    });
+    
+    res.json(Array.from(customersMap.values()));
+  } catch (error) {
+    console.error('Error fetching credit customers:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PROCESS CREDIT COLLECTION - Partial payment collection
+router.post('/credit-collection', authenticate, async (req, res) => {
+  try {
+    const { customerId, amount, paymentMethod, note, collectedBy } = req.body;
+    
+    if (!customerId || !amount || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
+    
+    // Find all credit orders for this customer that are still due
+    const creditOrders = await Order.find({
+      $or: [
+        { 'customer.name': customerId },
+        { 'customer._id': customerId },
+        { 'payment.customerName': customerId },
+        { 'payment.customerId': customerId }
+      ],
+      'payment.method': 'credit',
+      'payment.status': 'credit_due',
+      status: { $ne: 'cancelled' }
+    }).sort({ createdAt: 1 });
+    
+    let remainingAmount = amount;
+    const updatedOrders = [];
+    
+    for (const order of creditOrders) {
+      if (remainingAmount <= 0) break;
+      
+      const orderDue = order.total;
+      
+      if (remainingAmount >= orderDue) {
+        // Full payment for this order
+        order.payment.status = 'paid';
+        order.payment.collectedAt = new Date();
+        order.payment.collectedAmount = orderDue;
+        order.payment.collectionMethod = paymentMethod;
+        order.payment.collectionNote = note;
+        order.status = 'completed';
+        order.completedAt = new Date();
+        remainingAmount -= orderDue;
+        updatedOrders.push({ 
+          orderId: order._id, 
+          orderNumber: order.displayOrderNumber || order.orderNumber,
+          amount: orderDue, 
+          status: 'fully_paid' 
+        });
+      } else {
+        // Partial payment - update order total
+        const newTotal = orderDue - remainingAmount;
+        
+        // Create a record of partial payment
+        if (!order.payment.partialPayments) {
+          order.payment.partialPayments = [];
+        }
+        order.payment.partialPayments.push({
+          amount: remainingAmount,
+          method: paymentMethod,
+          note: note,
+          collectedAt: new Date(),
+          collectedBy: collectedBy
+        });
+        
+        order.total = newTotal;
+        order.subtotal = newTotal - (order.tax + order.serviceCharge);
+        order.payment.amount = newTotal;
+        order.payment.remainingDue = newTotal;
+        
+        updatedOrders.push({ 
+          orderId: order._id, 
+          orderNumber: order.displayOrderNumber || order.orderNumber,
+          amount: remainingAmount, 
+          status: 'partial_paid', 
+          remainingDue: newTotal 
+        });
+        remainingAmount = 0;
+      }
+      
+      await order.save();
+    }
+    
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('credit-collection-updated', { customerId, amount, updatedOrders });
+    }
+    
+    res.json({
+      success: true,
+      message: `Collected ₹${amount}`,
+      updatedOrders,
+      remainingAmount
+    });
+  } catch (error) {
+    console.error('Error processing credit collection:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -676,6 +845,7 @@ router.patch('/:id/complete-payment', authenticate, async (req, res) => {
         dueDate: paymentDetails.dueDate,
         customerName: paymentDetails.customerName,
         customerPhone: paymentDetails.customerPhone,
+        customerId: paymentDetails.customerId,
         notes: paymentDetails.notes
       };
       console.log(`✅ Credit sale recorded for ${paymentDetails.customerName}: ₹${paymentDetails.amount}`);
@@ -778,7 +948,7 @@ router.post('/table/:tableNumber/complete-billing', authenticate, async (req, re
 // Credit sale
 router.post('/:id/credit-sale', authenticate, async (req, res) => {
   try {
-    const { customerName, customerPhone, customerEmail, dueDate } = req.body;
+    const { customerName, customerPhone, customerEmail, dueDate, customerId } = req.body;
     
     const order = await Order.findById(req.params.id);
     if (!order) {
@@ -794,7 +964,7 @@ router.post('/:id/credit-sale', authenticate, async (req, res) => {
       dueDate: dueDate ? new Date(dueDate) : null,
       customerName: customerName,
       customerPhone: customerPhone,
-      customerId: order.customer?._id
+      customerId: customerId || customerName
     };
     
     order.status = 'completed';
